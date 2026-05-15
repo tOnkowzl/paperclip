@@ -175,9 +175,9 @@ describe("adapter routes", () => {
     expect(cursorAdapter.capabilities.supportsInstructionsBundle).toBe(true);
 
     // hermes_local supports skills + local JWT + the managed instructions bundle
-    // flow; Paperclip prepends bundle files into promptTemplate before calling
-    // hermes-paperclip-adapter because that adapter does not consume
-    // instructionsFilePath directly.
+    // flow; Paperclip prepends the configured instructionsFilePath entry file
+    // into promptTemplate before calling hermes-paperclip-adapter because that
+    // adapter does not consume instructionsFilePath directly.
     const hermesAdapter = res.body.find((a: any) => a.type === "hermes_local");
     expect(hermesAdapter).toBeDefined();
     expect(hermesAdapter.capabilities).toMatchObject({

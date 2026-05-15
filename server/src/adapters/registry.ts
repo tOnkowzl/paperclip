@@ -1,4 +1,7 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import type {
+  AdapterExecutionContext,
   AdapterModel,
   AdapterModelProfileDefinition,
   AdapterRuntimeCommandSpec,
@@ -8,6 +11,10 @@ import {
   buildSandboxNpmInstallCommand,
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
+import {
+  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  joinPromptSections,
+} from "@paperclipai/adapter-utils/server-utils";
 import {
   execute as acpxExecute,
   testEnvironment as acpxTestEnvironment,
@@ -128,7 +135,6 @@ import {
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
-import { agentInstructionsService } from "../services/agent-instructions.js";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
 
@@ -202,39 +208,32 @@ function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(
   return ctx;
 }
 
-function hasExplicitHermesInstructionsBundle(config: Record<string, unknown>): boolean {
-  const rootPath = typeof config.instructionsRootPath === "string" ? config.instructionsRootPath.trim() : "";
-  const filePath = typeof config.instructionsFilePath === "string" ? config.instructionsFilePath.trim() : "";
-  return rootPath.length > 0 || filePath.length > 0;
+function readNonEmptyString(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : "";
 }
 
-async function buildHermesInstructionsBundlePrompt(agent: {
-  id: string;
-  companyId: string;
-  name: string;
-  adapterConfig: unknown;
-}): Promise<string> {
-  const instructions = agentInstructionsService();
-  const bundle = await instructions.getBundle(agent).catch(() => null);
-  const hasRealBundleFiles =
-    bundle?.files.some((file) => !file.virtual && !file.deprecated) ?? false;
-  if (!hasRealBundleFiles) return "";
+async function buildHermesInstructionsFilePrompt(
+  config: Record<string, unknown>,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<string> {
+  const instructionsFilePath = readNonEmptyString(config.instructionsFilePath);
+  if (!instructionsFilePath) return "";
 
-  const exported = await instructions.exportFiles(agent).catch(() => null);
-  if (!exported) return "";
-
-  return Object.entries(exported.files)
-    .sort(([left], [right]) => {
-      if (left === exported.entryFile) return -1;
-      if (right === exported.entryFile) return 1;
-      return left.localeCompare(right);
-    })
-    .map(([name, body]) => {
-      const trimmed = body.trim();
-      return trimmed ? `# ${name}\n\n${trimmed}` : null;
-    })
-    .filter((entry): entry is string => Boolean(entry))
-    .join("\n\n");
+  const instructionsDir = `${path.dirname(instructionsFilePath)}/`;
+  try {
+    const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
+    return `${instructionsContents}\n\n` +
+      `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+      `Resolve any relative file references from ${instructionsDir}. ` +
+      "This base directory is authoritative for sibling instruction files; do not resolve those from the parent agent directory.";
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
+    );
+    return "";
+  }
 }
 
 function dedupeAdapterModels(models: AdapterModel[]): AdapterModel[] {
@@ -472,21 +471,29 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    const bundleContent = hasExplicitHermesInstructionsBundle(existingConfig)
-      ? await buildHermesInstructionsBundlePrompt(normalizedCtx.agent)
-      : "";
+    const instructionsPrompt = await buildHermesInstructionsFilePrompt(existingConfig, normalizedCtx.onLog);
 
-    // Keep Hermes' built-in heartbeat/task prompt intact unless we have custom
-    // prompt material to prepend. A bare auth guard would replace the default
-    // prompt, but a real instructions bundle must still be passed through
-    // promptTemplate because hermes-paperclip-adapter does not consume
-    // instructionsFilePath directly.
+    // Match claude_local/codex_local semantics: read only instructionsFilePath
+    // (the managed entry file, normally AGENTS.md), prepend its contents plus a
+    // path directive, and keep sibling files available by reference instead of
+    // concatenating the whole managed bundle into the prompt.
+    //
+    // Keep Hermes' built-in heartbeat/task prompt intact when there is no custom
+    // prompt material. If an instructions file must be injected but no explicit
+    // promptTemplate exists, include Paperclip's shared default template here so
+    // the instructions prefix does not replace the run/heartbeat instructions.
     if (promptTemplate) {
-      patchedConfig.promptTemplate = bundleContent
-        ? `${authGuardPrompt}\n\n${bundleContent}\n\n${promptTemplate}`
-        : `${authGuardPrompt}\n\n${promptTemplate}`;
-    } else if (bundleContent) {
-      patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${bundleContent}`;
+      patchedConfig.promptTemplate = joinPromptSections([
+        authGuardPrompt,
+        instructionsPrompt,
+        promptTemplate,
+      ]);
+    } else if (instructionsPrompt) {
+      patchedConfig.promptTemplate = joinPromptSections([
+        authGuardPrompt,
+        instructionsPrompt,
+        DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+      ]);
     }
 
     const patchedCtx = {
