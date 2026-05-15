@@ -10,6 +10,31 @@ const hermesExecuteMock = vi.hoisted(() =>
   })),
 );
 
+const agentInstructionsGetBundleMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    files: [] as Array<{
+      path: string;
+      size: number;
+      language: string;
+      markdown: boolean;
+      isEntryFile: boolean;
+      editable: boolean;
+      deprecated: boolean;
+      virtual: boolean;
+    }>,
+    entryFile: "AGENTS.md",
+    warnings: [] as string[],
+  })),
+);
+
+const agentInstructionsExportFilesMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    files: {} as Record<string, string>,
+    entryFile: "AGENTS.md",
+    warnings: [] as string[],
+  })),
+);
+
 vi.mock("hermes-paperclip-adapter/server", () => ({
   execute: hermesExecuteMock,
   testEnvironment: async () => ({
@@ -22,6 +47,13 @@ vi.mock("hermes-paperclip-adapter/server", () => ({
   listSkills: async () => [],
   syncSkills: async () => ({ entries: [] }),
   detectModel: async () => null,
+}));
+
+vi.mock("../services/agent-instructions.js", () => ({
+  agentInstructionsService: () => ({
+    getBundle: agentInstructionsGetBundleMock,
+    exportFiles: agentInstructionsExportFilesMock,
+  }),
 }));
 
 import {
@@ -56,6 +88,19 @@ const externalAdapter: ServerAdapterModule = {
   supportsLocalAgentJwt: false,
 };
 
+function instructionFileSummary(filePath: string, size = 128) {
+  return {
+    path: filePath,
+    size,
+    language: "markdown",
+    markdown: true,
+    isEntryFile: filePath === "AGENTS.md",
+    editable: true,
+    deprecated: false,
+    virtual: false,
+  };
+}
+
 describe("server adapter registry", () => {
   beforeEach(() => {
     unregisterServerAdapter("external_test");
@@ -68,6 +113,8 @@ describe("server adapter registry", () => {
     unregisterServerAdapter("claude_local");
     setOverridePaused("claude_local", false);
     hermesExecuteMock.mockClear();
+    agentInstructionsGetBundleMock.mockClear();
+    agentInstructionsExportFilesMock.mockClear();
   });
 
   it("registers external adapters and exposes them through lookup helpers", async () => {
@@ -187,6 +234,15 @@ describe("server adapter registry", () => {
 
   it("built-in claude_local adapter declares capability flags", () => {
     const adapter = findActiveServerAdapter("claude_local");
+    expect(adapter).not.toBeNull();
+    expect(adapter!.supportsInstructionsBundle).toBe(true);
+    expect(adapter!.instructionsPathKey).toBe("instructionsFilePath");
+    expect(adapter!.requiresMaterializedRuntimeSkills).toBe(false);
+    expect(adapter!.supportsLocalAgentJwt).toBe(true);
+  });
+
+  it("built-in hermes_local adapter declares instructions bundle capability flags", () => {
+    const adapter = findActiveServerAdapter("hermes_local");
     expect(adapter).not.toBeNull();
     expect(adapter!.supportsInstructionsBundle).toBe(true);
     expect(adapter!.instructionsPathKey).toBe("instructionsFilePath");
@@ -479,6 +535,151 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.promptTemplate).toBeUndefined();
     // Auth token is still injected.
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
+    expect(agentInstructionsGetBundleMock).not.toHaveBeenCalled();
+    expect(agentInstructionsExportFilesMock).not.toHaveBeenCalled();
+  });
+
+  it("prepends managed instructions bundle content to an existing Hermes promptTemplate", async () => {
+    agentInstructionsGetBundleMock.mockResolvedValueOnce({
+      files: [instructionFileSummary("AGENTS.md"), instructionFileSummary("SOUL.md")],
+      entryFile: "AGENTS.md",
+      warnings: [],
+    });
+    agentInstructionsExportFilesMock.mockResolvedValueOnce({
+      files: {
+        "SOUL.md": "Be empathetic.",
+        "AGENTS.md": "You are a helpful Hermes agent.",
+      },
+      entryFile: "AGENTS.md",
+      warnings: [],
+    });
+
+    const adapter = requireServerAdapter("hermes_local");
+
+    await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-456",
+        companyId: "company-123",
+        name: "Hermes Bundle Agent",
+        role: "general",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          instructionsRootPath: "/srv/agents/agent-456/instructions",
+          promptTemplate: "Existing Hermes prompt",
+        },
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(agentInstructionsGetBundleMock).toHaveBeenCalledTimes(1);
+    expect(agentInstructionsExportFilesMock).toHaveBeenCalledTimes(1);
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    const { promptTemplate } = patchedCtx.agent.adapterConfig;
+    expect(promptTemplate).toContain("Paperclip API safety rule");
+    expect(promptTemplate.indexOf("# AGENTS.md")).toBeLessThan(promptTemplate.indexOf("# SOUL.md"));
+    expect(promptTemplate).toContain("You are a helpful Hermes agent.");
+    expect(promptTemplate).toContain("Be empathetic.");
+    expect(promptTemplate.indexOf("Existing Hermes prompt")).toBeGreaterThan(
+      promptTemplate.indexOf("Be empathetic."),
+    );
+  });
+
+  it("injects instructionsFilePath bundle content for Hermes agents without duplicating promptTemplate", async () => {
+    agentInstructionsGetBundleMock.mockResolvedValueOnce({
+      files: [instructionFileSummary("AGENTS.md")],
+      entryFile: "AGENTS.md",
+      warnings: [],
+    });
+    agentInstructionsExportFilesMock.mockResolvedValueOnce({
+      files: {
+        "AGENTS.md": "Bundle content from the Instructions tab.",
+      },
+      entryFile: "AGENTS.md",
+      warnings: [],
+    });
+
+    const adapter = requireServerAdapter("hermes_local");
+
+    await adapter.execute({
+      runId: "run-filepath",
+      agent: {
+        id: "agent-filepath",
+        companyId: "company-123",
+        name: "Hermes FilePath Bundle Agent",
+        role: "general",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          instructionsFilePath: "/srv/agents/agent-filepath/instructions/AGENTS.md",
+        },
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(agentInstructionsGetBundleMock).toHaveBeenCalledTimes(1);
+    expect(agentInstructionsExportFilesMock).toHaveBeenCalledTimes(1);
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    const { promptTemplate } = patchedCtx.agent.adapterConfig;
+    expect(promptTemplate).toContain("Paperclip API safety rule");
+    expect(promptTemplate).toContain("# AGENTS.md");
+    expect(promptTemplate).toContain("Bundle content from the Instructions tab.");
+  });
+
+  it("skips Hermes bundle export when only the legacy promptTemplate pseudo-file is available", async () => {
+    agentInstructionsGetBundleMock.mockResolvedValueOnce({
+      files: [{
+        ...instructionFileSummary("promptTemplate.legacy.md"),
+        deprecated: true,
+        virtual: true,
+      }],
+      entryFile: "AGENTS.md",
+      warnings: ["Instructions root does not exist"],
+    });
+
+    const adapter = requireServerAdapter("hermes_local");
+
+    await adapter.execute({
+      runId: "run-missing-bundle",
+      agent: {
+        id: "agent-missing-bundle",
+        companyId: "company-123",
+        name: "Hermes Missing Bundle Agent",
+        role: "general",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          instructionsRootPath: "/srv/agents/missing/instructions",
+          promptTemplate: "Only template, no real bundle files",
+        },
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(agentInstructionsGetBundleMock).toHaveBeenCalledTimes(1);
+    expect(agentInstructionsExportFilesMock).not.toHaveBeenCalled();
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    const { promptTemplate } = patchedCtx.agent.adapterConfig;
+    const occurrences = (promptTemplate.match(/Only template, no real bundle files/g) ?? []).length;
+    expect(occurrences).toBe(1);
+    expect(promptTemplate).not.toContain("# AGENTS.md");
   });
 });
 

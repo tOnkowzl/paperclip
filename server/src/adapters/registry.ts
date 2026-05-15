@@ -128,6 +128,7 @@ import {
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
+import { agentInstructionsService } from "../services/agent-instructions.js";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
 
@@ -199,6 +200,41 @@ function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(
   }
 
   return ctx;
+}
+
+function hasExplicitHermesInstructionsBundle(config: Record<string, unknown>): boolean {
+  const rootPath = typeof config.instructionsRootPath === "string" ? config.instructionsRootPath.trim() : "";
+  const filePath = typeof config.instructionsFilePath === "string" ? config.instructionsFilePath.trim() : "";
+  return rootPath.length > 0 || filePath.length > 0;
+}
+
+async function buildHermesInstructionsBundlePrompt(agent: {
+  id: string;
+  companyId: string;
+  name: string;
+  adapterConfig: unknown;
+}): Promise<string> {
+  const instructions = agentInstructionsService();
+  const bundle = await instructions.getBundle(agent).catch(() => null);
+  const hasRealBundleFiles =
+    bundle?.files.some((file) => !file.virtual && !file.deprecated) ?? false;
+  if (!hasRealBundleFiles) return "";
+
+  const exported = await instructions.exportFiles(agent).catch(() => null);
+  if (!exported) return "";
+
+  return Object.entries(exported.files)
+    .sort(([left], [right]) => {
+      if (left === exported.entryFile) return -1;
+      if (right === exported.entryFile) return 1;
+      return left.localeCompare(right);
+    })
+    .map(([name, body]) => {
+      const trimmed = body.trim();
+      return trimmed ? `# ${name}\n\n${trimmed}` : null;
+    })
+    .filter((entry): entry is string => Boolean(entry))
+    .join("\n\n");
 }
 
 function dedupeAdapterModels(models: AdapterModel[]): AdapterModel[] {
@@ -436,11 +472,21 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    // Only inject the auth guard into promptTemplate when a custom template already exists.
-    // When no custom template is set, Hermes uses its built-in default heartbeat/task prompt —
-    // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
+    const bundleContent = hasExplicitHermesInstructionsBundle(existingConfig)
+      ? await buildHermesInstructionsBundlePrompt(normalizedCtx.agent)
+      : "";
+
+    // Keep Hermes' built-in heartbeat/task prompt intact unless we have custom
+    // prompt material to prepend. A bare auth guard would replace the default
+    // prompt, but a real instructions bundle must still be passed through
+    // promptTemplate because hermes-paperclip-adapter does not consume
+    // instructionsFilePath directly.
     if (promptTemplate) {
-      patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
+      patchedConfig.promptTemplate = bundleContent
+        ? `${authGuardPrompt}\n\n${bundleContent}\n\n${promptTemplate}`
+        : `${authGuardPrompt}\n\n${promptTemplate}`;
+    } else if (bundleContent) {
+      patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${bundleContent}`;
     }
 
     const patchedCtx = {
@@ -459,7 +505,8 @@ const hermesLocalAdapter: ServerAdapterModule = {
   syncSkills: hermesSyncSkills,
   models: hermesModels,
   supportsLocalAgentJwt: true,
-  supportsInstructionsBundle: false,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
   requiresMaterializedRuntimeSkills: false,
   agentConfigurationDoc: hermesAgentConfigurationDoc,
   detectModel: () => detectModelFromHermes(),
