@@ -174,6 +174,15 @@ describe("adapter routes", () => {
     expect(cursorAdapter.capabilities.requiresMaterializedRuntimeSkills).toBe(true);
     expect(cursorAdapter.capabilities.supportsInstructionsBundle).toBe(true);
 
+    const grokAdapter = res.body.find((a: any) => a.type === "grok_local");
+    expect(grokAdapter).toBeDefined();
+    expect(grokAdapter.capabilities).toMatchObject({
+      supportsInstructionsBundle: true,
+      supportsSkills: true,
+      supportsLocalAgentJwt: true,
+      requiresMaterializedRuntimeSkills: true,
+    });
+
     // hermes_local supports skills + local JWT + the managed instructions bundle
     // flow; Paperclip prepends the configured instructionsFilePath entry file
     // into promptTemplate before calling hermes-paperclip-adapter because that
