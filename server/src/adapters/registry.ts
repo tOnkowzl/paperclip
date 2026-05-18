@@ -233,6 +233,10 @@ async function buildHermesInstructionsFilePrompt(
   const instructionsDir = `${path.dirname(instructionsFilePath)}/`;
   try {
     const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
+    await onLog(
+      "stdout",
+      `[paperclip] Loaded agent instructions from "${instructionsFilePath}" (${instructionsContents.length} chars)\n`,
+    );
     return `${instructionsContents}\n\n` +
       `The above agent instructions were loaded from ${instructionsFilePath}. ` +
       `Resolve any relative file references from ${instructionsDir}. ` +
@@ -474,7 +478,6 @@ const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
     const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
 
     const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
     const existingEnv =
@@ -498,8 +501,8 @@ const hermesLocalAdapter: ServerAdapterModule = {
       ...existingConfig,
       env: {
         ...existingEnv,
-        ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
-        PAPERCLIP_RUN_ID: normalizedCtx.runId,
+        ...(normalizedCtx.authToken && !explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
+        ...(normalizedCtx.runId ? { PAPERCLIP_RUN_ID: normalizedCtx.runId } : {}),
       },
     };
 
